@@ -46,6 +46,118 @@ samples/ 下每行一个十进制整数，`#` 开头的行是注释：
 
 校验算法由实现选择（CRC32 之类的都行），但每条要满足：每个块一个校验字段、随块一起存；能检出该块内的单字节翻转；校验失败时报出块号，并支持跳过该块继续读后面的块。
 
-## 待补的文档
+## 实现文档
 
-实现完成后把这几件事写清楚：块布局（文件头、块头、块体、索引各自的字段与字节序）、随机访问怎么定位（查索引后怎么算偏移、怎么在块内解码出第 k 个点）、校验怎么算、以及编码器在什么条件下选用哪种块内编码。
+代码在 `icol/` 包（只用标准库），测试在 `tests/test_icol.py`，基准脚本 `bench.py`。
+
+- 编码：`icol.encode(values, out, block_size=512)`，`values` 可以是任意可迭代对象（CSV 用 `icol.iter_csv_ints(path)` 流式读），`out` 可以是路径或二进制文件对象。
+- 读取：`Reader(path)`，`r.read(i)` / `r[i]` 单点随机读（支持负下标），`r.read_range(a, b)` 区间读，`r.values()` 全列流式读，`r.verify()` 返回坏块号列表。
+- 区间读/全列读可用 `skip_corrupt=True` 跳过坏块；单点读到坏块抛 `CorruptBlockError`（`.block_no` 是块号）。
+- CLI：`python -m icol encode|decode|get|verify|info ...`。
+
+### 文件整体布局
+
+单文件、全小端字节序::
+
+    +----------------------+
+    | 文件头                |  固定 44 字节
+    +----------------------+
+    | 数据块 0              |  块头 12 字节 + 块体（变长）
+    +----------------------+
+    | 数据块 1              |
+    +----------------------+
+    | ...                   |
+    +----------------------+
+    | 块索引                |  num_blocks * 16 字节（定长条目）
+    +----------------------+
+
+索引的起始偏移记录在文件头里，打开文件时一次性读入内存并校验；
+三千万个点 / 每块 512 点 ≈ 5.9 万个条目 ≈ 940 KB，不随点数增长到不可控。
+
+### 文件头（44 字节，struct `"<8sHHIQIQII"`）
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| magic | 8s | 固定 `b"ICOLINT1"` |
+| version | uint16 | 格式版本，当前 1 |
+| header_len | uint16 | 头长度，44 |
+| block_size | uint32 | 每块最大点数（最后一块可不足） |
+| count | uint64 | 全列总点数 |
+| num_blocks | uint32 | 块数 |
+| index_offset | uint64 | 块索引在文件中的起始偏移 |
+| index_crc | uint32 | 块索引区整体的 CRC32 |
+| header_crc | uint32 | 文件头前 40 字节的 CRC32 |
+
+### 数据块
+
+块头 12 字节（struct `"<BBHII"`）：`codec uint8`（0=RAW，1=CONST，2=DELTA_BITPACK）、
+`reserved uint8`（写 0）、`count uint16`（本块点数）、`payload_len uint32`（块体字节数）、
+`crc32 uint32`。块体三种形态：
+
+- **RAW**：`count` 个 int64 小端原样存放。
+- **CONST**：1 个 int64，块内 `count` 个点全是它。
+- **DELTA_BITPACK**：`base int64` + `min_delta int64` + `w uint8`，随后是
+  `ceil((count-1)*w/8)` 字节的位打包数据。令 `delta[j] = value[j+1] - value[j]`，
+  `offset[j] = delta[j] - min_delta`（无符号、每个占 `w` 位），offset 按 LSB 在前
+  打包进一个大整数再小端落盘。恢复公式：`value[k] = base + k*min_delta + Σ_{j<k} offset[j]`。
+
+### 块索引条目（16 字节，struct `"<QIHBB"`）
+
+`file_offset uint64`（块头在文件中的偏移）、`total_len uint32`（块头+块体总字节数，
+用于跳块扫描）、`count uint16`、`codec uint8`、`reserved uint8`。条目定长，
+第 b 块的条目就在 `index_offset + b*16`；count/codec 与块头冗余存放，读取时互相对照。
+
+### 随机访问怎么定位
+
+1. 打开文件：读文件头（校验 magic/版本/头 CRC），按 `index_offset` 读入全部索引条目（校验索引 CRC）。
+2. 给定下标 i：`b, k = divmod(i, block_size)`，第 b 块条目直接在内存数组第 b 项。
+3. 按条目里的 `file_offset` `seek` 到块头，读 `total_len` 字节并校验块 CRC。
+4. 块内解出第 k 个点：
+   - CONST：就是那一个 int64；
+   - RAW：块体偏移 `8*k` 处取 int64；
+   - DELTA_BITPACK：读 base/min_delta/w，从位打包整数里取前 k 个 offset 求和，
+     代入 `base + k*min_delta + Σoffset`。最多做 block_size−1 次（默认 ≤511 次）
+     简单位运算，不需要解整块，更不需要从头解列。
+5. 耗时与 i 无关：定位是常数次查表 + 一次 seek，块内工作量只取决于 `k = i mod block_size`。
+   `read_range` / `values` 走整块解码，并带小块 LRU 缓存（默认 8 块）。
+
+### 校验怎么算
+
+CRC32 用标准库 `zlib.crc32`（IEEE 802 多项式），可检出块内任意单字节翻转：
+
+- 块校验：`crc32 = crc32(块头前 8 字节)` 再 `crc32(块体)` 续算，存块头第 9–12 字节。
+- 索引校验：全部索引条目连续字节的 CRC32，存文件头 `index_crc`。
+- 文件头校验：头前 40 字节的 CRC32，存头末 4 字节。
+
+校验失败时，单点读抛 `CorruptBlockError`（带块号）；因为块间相互独立（每块存自己的
+base，不依赖前块）且索引给出每块的绝对偏移，坏块不影响定位和解码任何其它块。
+`Reader.verify()` 逐块扫描，返回全部坏块号；`read_range(..., skip_corrupt=True)`、
+`blocks(skip_corrupt=True)` 直接跳过坏块继续读后面的块。
+
+### 编码器选码规则（逐块独立决定）
+
+- 块内全部相等 → **CONST**（重复值/长常量段）。
+- 否则计算块内全部差分的 `min_delta`、`max_delta` 与位宽 `w = (max_delta-min_delta).bit_length()`：
+  当差分跨度不超过 56 位、且位打包块体（17 + `ceil((n−1)*w/8)` 字节）小于定长
+  （8n 字节）时用 **DELTA_BITPACK**（递增、±1 抖动、负值波动都是这种）。
+- 其余（例如 int64 正负极值反复横跳导致差分溢出）退回 **RAW** 定长兜底，保证绝不
+  比“按块定长”更差。
+
+### 确定性
+
+输出字节只由输入值和 `block_size` 决定：不写时间戳、不写随机数，每块选码与位宽都是
+输入的确定性函数；测试里同一序列编码两次逐字节一致。建索引流式进行，内存里始终只有
+一个块（512 个 int），常驻内存与点数无关。
+
+### 实测结果（本机，Python 3.14，`python3 bench.py`）
+
+- 五个样例编码后合计 233,717 字节，为定长 3,600,000 字节的 **6.5%**（目标 ≤20%）；
+  其中最接近上限的 `negatives.csv` 为 18.9%，其余 3.5%–6.6%，全部达标。
+- 3000 万点合成计数器（递增+抖动+常量段+跳变）流式编码 **6.3 秒**，峰值 RSS **37 MB**，
+  文件 8.6 MB（定长 240 MB 的 3.6%）。
+- 纯随机单点读（关闭块缓存）约 **5.7 万次/秒**，目标 2 万；开头块与末尾块单次耗时无差异。
+
+### 运行测试与基准
+
+    python3 -m unittest discover -s tests -v
+    python3 bench.py
