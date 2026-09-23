@@ -46,6 +46,101 @@ samples/ 下每行一个十进制整数，`#` 开头的行是注释：
 
 校验算法由实现选择（CRC32 之类的都行），但每条要满足：每个块一个校验字段、随块一起存；能检出该块内的单字节翻转；校验失败时报出块号，并支持跳过该块继续读后面的块。
 
-## 待补的文档
+## 实现：colint
 
-实现完成后把这几件事写清楚：块布局（文件头、块头、块体、索引各自的字段与字节序）、随机访问怎么定位（查索引后怎么算偏移、怎么在块内解码出第 k 个点）、校验怎么算、以及编码器在什么条件下选用哪种块内编码。
+代码在 `colint/` 包（纯标准库），测试在 `tests/`（unittest），规模基准在 `tools/bench.py`。
+
+```bash
+python3 -m unittest discover -s tests        # 跑测试
+python3 -m colint encode in.csv out.cl       # CSV（# 为注释行）-> colint 文件
+python3 -m colint decode out.cl back.csv     # 解码回 CSV，--skip-corrupt 跳过坏块
+python3 -m colint verify out.cl              # 校验所有块，报出坏块号
+python3 -m colint bench-read out.cl          # 随机读基准
+python3 tools/bench.py                       # 3000 万点规模基准（编码/内存/随机读）
+```
+
+编程接口：`colint.encode(values, out)` 一次性编码（`values` 可以是惰性生成器）；
+`colint.Encoder` 逐点 `add()` 流式编码；`colint.Reader` 打开文件后
+`read(i)` 单点读、`[a:b]` 切片、`iter_values(strict=False)` 跳坏块迭代、
+`read_block(n)` 按块解码、`check()` 全量校验。
+
+### 文件布局
+
+所有整数小端。一个自包含文件，依次是：
+
+```
++-------------------+  文件头 32 字节，struct "<8sQIIQ"
+| magic "CLINT001"  |  8 字节
+| count             |  u64 总点数
+| block_size        |  u32 每块点数（默认 256，最后一块可不足）
+| num_blocks        |  u32 块数
+| index_offset      |  u64 索引区起始偏移
++-------------------+
+| block 0 .. N-1    |  每块 = 块头 12 字节 + 块体
++-------------------+
+| 块索引            |  num_blocks x 12 字节，struct "<QI"：
+|                   |  (块起始偏移 u64, 块总长 u32 含块头)
++-------------------+
+```
+
+块头 12 字节，struct `"<BBHII"`：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| encoding | u8 | 0=CONST, 1=FOR, 2=RAW |
+| flags | u8 | 保留，恒 0 |
+| count | u16 | 本块点数 |
+| payload_len | u32 | 块体字节数 |
+| crc32 | u32 | 见「校验」 |
+
+块号 `b` 覆盖下标 `[b*block_size, b*block_size+count)`，起始下标由块号隐式推出，
+索引里不重复存。
+
+### 块内编码（编码器按块选最小的一种）
+
+- **CONST**：块内所有值相等。块体 8 字节：`<q` 值。
+- **FOR**（frame of reference）：块体 = `<q` 块内最小值 min + `B` 位宽 w +
+  按 w 位小端位序紧密排列的 `(value - min)`。w 是 `(max-min)` 的最小位宽。
+  负数、跳变都由 min 自然吸收，只影响本块位宽。
+- **RAW**：块体 = count x `<q` 原样 int64。当 FOR 反而更大时兜底
+  （例如块内同时出现 int64 两极）。
+
+选择逻辑：全等选 CONST；否则若 `9 + ceil(count*w/8) < 8*count` 选 FOR，否则 RAW。
+输出只是输入值与 block_size 的纯函数，无时间戳、无随机数，同一份数据
+编码两遍逐字节相同（有测试保证）。
+
+### 随机访问怎么定位
+
+读下标 `i`：
+
+1. `block_no = i // block_size`，`k = i % block_size`；
+2. 索引是定长记录数组，直接取第 `block_no` 条得到 `(offset, length)`，
+   seek 到 `offset` 读块头；
+3. 按编码直接在块内取第 `k` 个，**不需要解码整个块**：
+   - CONST：读 8 字节即得；
+   - RAW：seek 到 `块体 + 8*k` 读 8 字节；
+   - FOR：读 9 字节头得 `(min, w)`，第 k 个值的比特区间是
+     `[k*w, k*w+w)`，seek 到对应字节读最多 9 字节，移位掩码取出后加 min。
+
+每次单点读的 I/O 次数与字节数都是常数，与下标无关（有测试用计数文件
+对象验证首、中、尾下标的读开销完全一致）。索引常驻内存，每块 12 字节，
+3000 万点约 1.4 MB。
+
+### 校验
+
+每块一个 CRC32（`zlib.crc32`），覆盖「块头前 8 字节（encoding/flags/
+count/payload_len）+ 整个块体」，存在块头 crc32 字段里。`read_block` /
+`iter_values` / `check` 解码前校验，失败抛 `CorruptBlockError`，异常带
+`block_no` 属性，消息里含块号。`iter_values(strict=False)` 和
+`decode --skip-corrupt` 会跳过坏块继续读后面的块；`check()` 返回所有
+坏块号列表。单点 `read()` 为速度不做校验（只读几个字节，验整个块不划算），
+需要防坏块时用上述接口。
+
+### 内存与性能实测（本机）
+
+- 3000 万点流式编码（生成器输入）：峰值 RSS **14 MB**，耗时约 4 秒
+  （目标：300 MB / 5 分钟）。索引条目先落临时文件，内存不随点数增长。
+- 单点随机读：3000 万点文件上 **12 万次/秒**（目标 2 万），耗时与下标无关。
+- 体积实测：ramp 14.2%、repeated 3.4%、jumps 10.1%、negatives 17.6%、
+  mixed 11.0%，合计 383789 字节，全部低于定长的 20% 上限
+  （`tests/test_colint.py::SizeTargetTest` 持续回归）。
